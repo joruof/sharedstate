@@ -34,7 +34,7 @@ class SubSubState:
 
 store = shs.create("test", State())
 root = store.get()
+root.write_lock()
 
 while True:
     time.sleep(1)
-    print(root)

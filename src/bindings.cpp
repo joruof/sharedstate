@@ -12,8 +12,9 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 
-#include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
+#include <pybind11/numpy.h>
+#include <pybind11/stl.h>
 
 namespace py = pybind11;
 
@@ -65,6 +66,7 @@ struct file_lock {
         lock.l_whence = SEEK_SET;
         lock.l_start = offset;
         lock.l_len = len;
+        lock.l_pid = 0;
 
         return lock;
     }
@@ -74,7 +76,7 @@ struct file_lock {
         flock lock = buildFlock();
         lock.l_type = type;
 
-        if (-1 == fcntl(descriptor, blocking ? F_SETLKW : F_SETLK, &lock)) {
+        if (-1 == fcntl(descriptor, blocking ? F_OFD_SETLKW : F_OFD_SETLK , &lock)) {
             return errno;
         }
 
@@ -86,7 +88,7 @@ struct file_lock {
         flock lock = buildFlock();
         lock.l_type = F_UNLCK;
 
-        if (-1 == fcntl(descriptor, F_SETLK, &lock)) {
+        if (-1 == fcntl(descriptor, F_OFD_SETLK, &lock)) {
             return errno;
         }
 
@@ -98,7 +100,7 @@ struct file_lock {
         flock lock = buildFlock();
         lock.l_type = type;
 
-        if (-1 == fcntl(descriptor, F_GETLK, &lock)) {
+        if (-1 == fcntl(descriptor, F_OFD_GETLK, &lock)) {
             return false;
         }
 
@@ -538,7 +540,7 @@ struct StoreObject {
 
         if (obj_type.field_map.count(name) == 0) {
             std::string msg = "store object has no attribute \"" + name + "\"";
-            throw py::value_error(msg);
+            throw py::attribute_error(msg);
         }
     }
 
@@ -580,6 +582,17 @@ struct StoreObject {
                 field.length,
                 F_UNLCK).lock();
     }
+    
+    std::vector<std::string> slots () {
+
+        std::vector<std::string> s;
+
+        for (Field& f : obj_type.fields) {
+            s.push_back(f.name);
+        }
+
+        return s;
+    }
 };
 
 struct Store {
@@ -587,6 +600,7 @@ struct Store {
     std::string store_name;
     int shm_descriptor = -1;
     size_t total_size = 0;
+    uint64_t creation_time = 0;
 
     bool server = false;
 
@@ -642,35 +656,47 @@ struct Store {
                     shm_descriptor,
                     0);
         } else {
-            // wait for the server to finish initialization 
-            
-            struct stat s;
-            std::memset(&s, 0, sizeof(struct stat));
-
-            do {
-                // get out of the loop, if necessary
-                if (PyErr_CheckSignals() != 0) { 
-                    throw py::error_already_set();
-                }
-                
-                // shameful busy waiting, ...
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                if (shm_descriptor == -1) {
-                    shm_descriptor = shm_open(this->store_name.c_str(), O_RDWR, 0600);
-                }
-                fstat(shm_descriptor, &s);
-            } while(s.st_mode != 0100666); // ... it's the devil's business
-
-            total_size = s.st_size;
-
-            memory_start = (uint8_t*)mmap(
-                    0, 
-                    s.st_size,
-                    PROT_READ | PROT_WRITE, 
-                    MAP_SHARED, 
-                    shm_descriptor,
-                    0);
+            init_client();
         }
+    }
+
+    void init_client () {
+
+        // wait for the server to finish initialization 
+        
+        struct stat s;
+        std::memset(&s, 0, sizeof(struct stat));
+
+        do {
+            // get out of the loop, if necessary
+            if (PyErr_CheckSignals() != 0) { 
+                throw py::error_already_set();
+            }
+            
+            // shameful busy waiting, ...
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            if (shm_descriptor == -1) {
+                shm_descriptor = shm_open(this->store_name.c_str(), O_RDWR, 0600);
+            }
+            fstat(shm_descriptor, &s);
+        } while(s.st_mode != 0100666); // ... it's the devil's business
+
+        creation_time = s.st_ctim.tv_sec * 10e9 + s.st_ctim.tv_nsec;
+
+        total_size = s.st_size;
+
+        memory_start = (uint8_t*)mmap(
+                0, 
+                s.st_size,
+                PROT_READ | PROT_WRITE, 
+                MAP_SHARED, 
+                shm_descriptor,
+                0);
+
+        type_dict.clear();
+
+        object_tree_start = read_type_dict(type_dict, memory_start);
+        read_val(object_tree_start, main_obj_type_name);
     }
 
     ~Store () {
@@ -681,6 +707,40 @@ struct Store {
         if (shm_descriptor != -1 && server) {
             shm_unlink(store_name.c_str());
         }
+    }
+
+    void check_for_upgrade () {
+
+        if (server) {
+            return;
+        }
+
+        int tmp_descriptor = shm_open(this->store_name.c_str(), O_RDWR, 0600);
+
+        if (tmp_descriptor == -1) {
+            return;
+        }
+
+        struct stat s;
+        if (0 > fstat(shm_descriptor, &s)) {
+            return;
+        }
+
+        close(tmp_descriptor);
+
+        size_t new_time = s.st_ctim.tv_sec * 10e9 + s.st_ctim.tv_nsec;
+
+        if (new_time <= creation_time) {
+            return;
+        }
+
+        if (memory_start != nullptr) {
+            munmap(memory_start, total_size);
+        }
+        close(shm_descriptor);
+        shm_descriptor = -1;
+
+        init_client();
     }
 
     void retruncate () {
@@ -799,6 +859,7 @@ PYBIND11_MODULE(sharedstate, m) {
                     return py::object(py::none());
             }
         })
+        .def_property_readonly("__slots__", &StoreObject::slots)
         .def("write_lock", &StoreObject::write_lock)
         .def("read_lock", &StoreObject::read_lock)
         .def("unlock", &StoreObject::read_lock)
@@ -808,6 +869,7 @@ PYBIND11_MODULE(sharedstate, m) {
 
     py::class_<Store>(m, "Store")
         .def("get", &Store::get)
+        .def("check_for_upgrade", &Store::check_for_upgrade)
         .def("write_lock", &Store::write_lock)
         .def("read_lock", &Store::read_lock)
         .def("unlock", &Store::read_lock);
@@ -834,11 +896,6 @@ PYBIND11_MODULE(sharedstate, m) {
     m.def("open", [&](std::string store_name) {
 
         std::unique_ptr<Store> store = std::make_unique<Store>(store_name, false);
-
-        uint8_t* data_seg = read_type_dict(store->type_dict, store->memory_start);
-
-        read_val(data_seg, store->main_obj_type_name);
-        store->object_tree_start = data_seg;
 
         return store;
     });
