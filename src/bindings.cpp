@@ -1,3 +1,4 @@
+#include <cstring>
 #include <ios>
 #include <memory>
 #include <string>
@@ -48,18 +49,17 @@ namespace py = pybind11;
 /**
  * Thin wrapper around the file lock (or rather range lock) concept.
  */
-struct file_lock {
+struct RangeLock {
     
     const int descriptor;
     const int offset;
     const size_t len;
-    const int type;
 
-    file_lock (int descriptor, int offset, size_t len, int type) :
-        descriptor{descriptor}, offset{offset}, len{len}, type{type} {
+    RangeLock (int descriptor, int offset, size_t len) :
+        descriptor{descriptor}, offset{offset}, len{len}  {
     }
 
-    flock buildFlock() {
+    flock buildFlock(short type) {
 
         flock lock;
 
@@ -67,14 +67,14 @@ struct file_lock {
         lock.l_start = offset;
         lock.l_len = len;
         lock.l_pid = 0;
+        lock.l_type = type;
 
         return lock;
     }
 
-    int lock (bool blocking = true) { 
+    int lock (short type, bool blocking = true) { 
 
-        flock lock = buildFlock();
-        lock.l_type = type;
+        flock lock = buildFlock(type);
 
         if (-1 == fcntl(descriptor, blocking ? F_OFD_SETLKW : F_OFD_SETLK , &lock)) {
             return errno;
@@ -85,8 +85,7 @@ struct file_lock {
 
     int unlock () {
 
-        flock lock = buildFlock();
-        lock.l_type = F_UNLCK;
+        flock lock = buildFlock(F_UNLCK);
 
         if (-1 == fcntl(descriptor, F_OFD_SETLK, &lock)) {
             return errno;
@@ -95,10 +94,9 @@ struct file_lock {
         return 0;
     }
 
-    bool check () {
+    bool check (short type) {
 
-        flock lock = buildFlock();
-        lock.l_type = type;
+        flock lock = buildFlock(type);
 
         if (-1 == fcntl(descriptor, F_OFD_GETLK, &lock)) {
             return false;
@@ -334,6 +332,45 @@ uint8_t* write_type_dict (TypeDict& type_dict, uint8_t* mem) {
 }
 
 /**
+ * Calculates the size of the serialized type dict.
+ */
+size_t type_dict_size (TypeDict& type_dict) {
+
+    size_t tds = 0;
+
+    tds += sizeof(type_dict.size());
+
+    for (auto kv: type_dict) {
+
+        const std::string& type_name = kv.first;
+        ObjectType& ot = kv.second;
+
+        tds += sizeof(uint32_t);
+        tds += type_name.length();
+
+        tds += sizeof(ot.fields.size());
+
+        for (Field& f: ot.fields) {
+
+            tds += sizeof(f.kind);
+
+            tds += sizeof(uint32_t);
+            tds += f.name.length();
+
+            tds += sizeof(f.length);
+            tds += sizeof(f.offset);
+
+            if (f.kind == KIND_STRUCT) {
+                tds += sizeof(uint32_t);
+                tds += f.ref_type_name.length();
+            }
+        }
+    }
+
+    return tds;
+}
+
+/**
  * Reading helper functions
  */
 
@@ -489,16 +526,21 @@ void write_object (
 
 struct StoreObject {
 
-    int& shm_descriptor;
+    int shm_descriptor;
+
     uint8_t* memory_start;
     uint8_t* object_memory;
+
     std::string obj_type_qualname;
     ObjectType& obj_type;
-
     TypeDict& type_dict;
 
+    RangeLock mem_lock;
+
+    std::shared_ptr<std::vector<uint8_t>> own_data = nullptr;
+
     StoreObject (
-            int& shm_descriptor,
+            int shm_descriptor,
             uint8_t* memory_start,
             uint8_t* object_memory,
             std::string obj_type_qualname,
@@ -509,78 +551,45 @@ struct StoreObject {
           object_memory{object_memory},
           obj_type_qualname{obj_type_qualname},
           obj_type{obj_type},
-          type_dict{type_dict} {
+          type_dict{type_dict},
+          mem_lock(shm_descriptor, object_memory - memory_start, obj_type.length) {
     }
 
-    void write_lock () {
-        file_lock(
-                shm_descriptor,
-                object_memory - memory_start,
-                obj_type.length,
-                F_WRLCK).lock();
-    }
-
-    void read_lock () {
-        file_lock(
-                shm_descriptor,
-                object_memory - memory_start,
-                obj_type.length,
-                F_RDLCK).lock();
-    }
-
-    void unlock () {
-        file_lock(
-                shm_descriptor,
-                object_memory - memory_start,
-                obj_type.length,
-                F_UNLCK).lock();
-    }
-
-    void check_attr (std::string name) {
+    Field& get_field (std::string& name) {
 
         if (obj_type.field_map.count(name) == 0) {
             std::string msg = "store object has no attribute \"" + name + "\"";
             throw py::attribute_error(msg);
         }
+
+        return obj_type[name];
     }
 
-    void write_lock_field (std::string name) {
+    void write_lock_field (std::string& name) {
 
-        check_attr(name);
+        Field& field = get_field(name);
 
-        Field& field = obj_type[name];
-
-        file_lock(
-                shm_descriptor,
-                object_memory - memory_start + field.offset,
-                field.length,
-                F_WRLCK).lock();
+        RangeLock(shm_descriptor,
+                  object_memory - memory_start + field.offset,
+                  field.length).lock(F_WRLCK);
     }
 
-    void read_lock_field (std::string name) {
+    void read_lock_field (std::string& name) {
 
-        check_attr(name);
+        Field& field = get_field(name);
 
-        Field& field = obj_type[name];
-
-        file_lock(
-                shm_descriptor,
-                object_memory - memory_start + field.offset,
-                field.length,
-                F_RDLCK).lock();
+        RangeLock(shm_descriptor,
+                  object_memory - memory_start + field.offset,
+                  field.length).lock(F_RDLCK);
     }
 
-    void unlock_field (std::string name) {
+    void unlock_field (std::string& name) {
 
-        check_attr(name);
-        
-        Field& field = obj_type[name];
+        Field& field = get_field(name);
 
-        file_lock(
-                shm_descriptor,
-                object_memory - memory_start + field.offset,
-                field.length,
-                F_UNLCK).lock();
+        RangeLock(shm_descriptor,
+                  object_memory - memory_start + field.offset,
+                  field.length).unlock();
     }
     
     std::vector<std::string> slots () {
@@ -592,6 +601,19 @@ struct StoreObject {
         }
 
         return s;
+    }
+
+    StoreObject copy () {
+
+        StoreObject so(-1, 0, 0, obj_type_qualname, obj_type, type_dict);
+
+        so.own_data = std::make_shared<std::vector<uint8_t>>(obj_type.length);
+        std::memcpy(so.own_data->data(), object_memory, obj_type.length);
+
+        so.memory_start = so.own_data->data();
+        so.object_memory = so.own_data->data();
+
+        return so;
     }
 };
 
@@ -611,53 +633,73 @@ struct Store {
 
     std::string main_obj_type_name;
 
-    Store (std::string store_name, bool server) {
-
-        this->server = server;
+    Store (std::string store_name) {
 
         if (store_name.find("/") == store_name.npos) {
             this->store_name = "/" + store_name;
         } else {
             py::value_error("store name must not contain \"/\"");
         }
+    }
 
-        if (server) {
+    void init_server (py::object& obj) {
+
+        server = true;
+
+        shm_descriptor = shm_open(this->store_name.c_str(), O_CREAT | O_RDWR, 0600);
+
+        // if we find an opened memory segment with a non-zero size,
+        // it's likely an old segment, thus we unlink and recreate it
+        
+        struct stat shm_stat;
+        std::memset(&shm_stat, 0, sizeof(struct stat));
+        fstat(shm_descriptor, &shm_stat);
+
+        if (shm_stat.st_size != 0) {
+            shm_unlink(store_name.c_str());
+            close(shm_descriptor);
+
             shm_descriptor = shm_open(this->store_name.c_str(), O_CREAT | O_RDWR, 0600);
-
-            // if we find an opened memory segment with a non-zero size,
-            // it's likely an old segment, thus we unlink and recreate it
-            
-            struct stat shm_stat;
-            std::memset(&shm_stat, 0, sizeof(struct stat));
-            fstat(shm_descriptor, &shm_stat);
-
-            if (shm_stat.st_size != 0) {
-                shm_unlink(store_name.c_str());
-                close(shm_descriptor);
-
-                shm_descriptor = shm_open(this->store_name.c_str(), O_CREAT | O_RDWR, 0600);
-            }
-
-            if (0 > shm_descriptor) {
-                throw std::runtime_error("opening shared memory failed");
-            }
-
-            // because we don't know how big the shared memory is gonna be
-            // we initially just truncate to 10 MB
-            if (0 > ftruncate(shm_descriptor, 10000000)) {
-                throw std::runtime_error("truncating shared memory failed");
-            }
-
-            memory_start = (uint8_t*)mmap(
-                    0, 
-                    10000000,
-                    PROT_READ | PROT_WRITE, 
-                    MAP_SHARED, 
-                    shm_descriptor,
-                    0);
-        } else {
-            init_client();
         }
+
+        if (0 > shm_descriptor) {
+            throw std::runtime_error("opening shared memory failed");
+        }
+
+        // creating type dict and resizing shared memory
+
+        build_type_dict(type_dict, obj);
+
+        main_obj_type_name = get_fq_type_name(obj);
+
+        total_size = type_dict_size(type_dict)
+                   + sizeof(uint32_t) + main_obj_type_name.length()
+                   + type_dict[main_obj_type_name].length;
+
+        if (0 > ftruncate(shm_descriptor, total_size)) {
+            throw std::runtime_error("truncating shared memory failed");
+        }
+
+        memory_start = (uint8_t*)mmap(
+                0, 
+                total_size,
+                PROT_READ | PROT_WRITE, 
+                MAP_SHARED, 
+                shm_descriptor,
+                0);
+
+        // writing initial data
+
+        uint8_t* data_seg = write_type_dict(type_dict, memory_start);
+
+        write_val(data_seg, main_obj_type_name);
+        object_tree_start = data_seg;
+
+        write_object(object_tree_start, type_dict, obj, main_obj_type_name);
+
+        // marks the store as ready to be used by clients
+        
+        fchmod(shm_descriptor, 0666);
     }
 
     void init_client () {
@@ -743,45 +785,16 @@ struct Store {
         init_client();
     }
 
-    void retruncate () {
-
-        // very questionable, needs improvements
-
-        size_t object_tree_offset = object_tree_start - memory_start;
-        total_size = object_tree_offset + type_dict[main_obj_type_name].length;
-
-        if (0 > ftruncate(shm_descriptor, total_size)) {
-            throw std::runtime_error("truncating shared memory failed");
-        }
-
-        munmap(memory_start, 10000000);
-        memory_start = (uint8_t*)mmap(
-                0, 
-                total_size,
-                PROT_READ | PROT_WRITE, 
-                MAP_SHARED, 
-                shm_descriptor,
-                0);
-
-        object_tree_start = memory_start + object_tree_offset;
-    }
-
-    void finish_init () {
-
-        // mark the store as ready to be used by clients
-        fchmod(shm_descriptor, 0666);
-    }
-
     void write_lock () {
-        file_lock(shm_descriptor, 0, total_size, F_WRLCK).lock();
+        RangeLock(shm_descriptor, 0, total_size).lock(F_WRLCK);
     }
 
     void read_lock () {
-        file_lock(shm_descriptor, 0, total_size, F_RDLCK).lock();
+        RangeLock(shm_descriptor, 0, total_size).lock(F_RDLCK);
     }
 
     void unlock () {
-        file_lock(shm_descriptor, 0, total_size, F_UNLCK).unlock();
+        RangeLock(shm_descriptor, 0, total_size).unlock();
     }
 
     StoreObject get () {
@@ -801,16 +814,12 @@ PYBIND11_MODULE(sharedstate, m) {
     py::class_<StoreObject>(m, "StoreObject")
         .def("__setattr__", [](StoreObject& self, std::string name, py::object value) {
 
-            self.check_attr(name);
-
-            Field& field = self.obj_type[name];
+            Field& field = self.get_field(name);
             write_field(self.object_memory, self.type_dict, field, value);
         })
         .def("__getattr__", [](StoreObject& self, std::string name) {
 
-            self.check_attr(name);
-
-            Field& f = self.obj_type[name];
+            Field& f = self.get_field(name);
             uint8_t* ptr = self.object_memory + f.offset;
 
             switch (f.kind) {
@@ -860,42 +869,45 @@ PYBIND11_MODULE(sharedstate, m) {
             }
         })
         .def_property_readonly("__slots__", &StoreObject::slots)
-        .def("write_lock", &StoreObject::write_lock)
-        .def("read_lock", &StoreObject::read_lock)
-        .def("unlock", &StoreObject::read_lock)
+        .def("copy", &StoreObject::copy)
+        .def("__copy__", [](StoreObject& self) {
+            return self.copy();
+        })
+        .def("__deepcopy__", [](StoreObject& self, py::object& memo) {
+            return self.copy();
+        })
+        .def("write_lock", [](StoreObject& self) {
+            self.mem_lock.lock(F_WRLCK);
+        })
+        .def("read_lock", [](StoreObject& self) {
+            self.mem_lock.lock(F_RDLCK);
+        })
+        .def("unlock", [](StoreObject& self){
+            self.mem_lock.unlock();
+        })
         .def("write_lock_field", &StoreObject::write_lock_field)
         .def("read_lock_field", &StoreObject::read_lock_field)
-        .def("unlock_field", &StoreObject::read_lock_field);
+        .def("unlock_field", &StoreObject::unlock_field);
 
     py::class_<Store>(m, "Store")
         .def("get", &Store::get)
         .def("check_for_upgrade", &Store::check_for_upgrade)
         .def("write_lock", &Store::write_lock)
         .def("read_lock", &Store::read_lock)
-        .def("unlock", &Store::read_lock);
+        .def("unlock", &Store::unlock);
 
     m.def("create", [&](std::string store_name, py::object& obj) {
 
-        std::unique_ptr<Store> store = std::make_unique<Store>(store_name, true);
-
-        build_type_dict(store->type_dict, obj);
-
-        uint8_t* data_seg = write_type_dict(store->type_dict, store->memory_start);
-
-        store->main_obj_type_name = get_fq_type_name(obj);
-        write_val(data_seg, store->main_obj_type_name);
-        store->object_tree_start = data_seg;
-
-        store->retruncate();
-        write_object(store->object_tree_start, store->type_dict, obj, store->main_obj_type_name);
-        store->finish_init();
+        std::unique_ptr<Store> store = std::make_unique<Store>(store_name);
+        store->init_server(obj);
 
         return store;
     });
 
     m.def("open", [&](std::string store_name) {
 
-        std::unique_ptr<Store> store = std::make_unique<Store>(store_name, false);
+        std::unique_ptr<Store> store = std::make_unique<Store>(store_name);
+        store->init_client();
 
         return store;
     });

@@ -5,11 +5,13 @@ import sharedstate as shs
 
 store = shs.open("test")
 root = store.get()
-root.read_lock_field("test_bool")
+#root.read_lock_field("test_bool")
 
 print(root)
 print(root.__slots__)
 print(hasattr(root, "__autogui__"))
+
+root_copy = root.copy()
 
 while viz.wait():
     store.check_for_upgrade()
@@ -17,6 +19,7 @@ while viz.wait():
 
     if viz.begin_window("test"):
         viz.autogui(root, name="root")
+        viz.autogui(root_copy, name="root_copy")
     viz.end_window()
 
 print(root.test_float)
