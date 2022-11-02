@@ -638,7 +638,7 @@ struct Store {
         if (store_name.find("/") == store_name.npos) {
             this->store_name = "/" + store_name;
         } else {
-            py::value_error("store name must not contain \"/\"");
+            throw py::value_error("store name must not contain \"/\"");
         }
     }
 
